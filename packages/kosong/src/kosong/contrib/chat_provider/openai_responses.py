@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator, Sequence
 from typing import TYPE_CHECKING, Any, Self, TypedDict, Unpack, cast, get_args
 
 import httpx
-from openai import AsyncStream, OpenAIError
+from openai import AsyncOpenAI, AsyncStream, OpenAIError
 from openai.types.responses import (
     Response,
     ResponseInputItemParam,
@@ -122,11 +122,15 @@ class OpenAIResponses:
         api_key: str | None = None,
         base_url: str | None = None,
         stream: bool = True,
+        instructions_mode: bool = False,
         tool_message_conversion: ToolMessageConversion | None = None,
         **client_kwargs: Any,
     ):
         self._model = model
         self._stream = stream
+        # When True, pass system_prompt as `instructions=` kwarg (required by some backends,
+        # e.g. chatgpt.com/backend-api/codex) instead of prepending a developer message.
+        self._instructions_mode: bool = instructions_mode
         self._tool_message_conversion: ToolMessageConversion | None = tool_message_conversion
         self._api_key: str | None = api_key
         self._base_url: str | None = base_url
@@ -137,6 +141,11 @@ class OpenAIResponses:
             client_kwargs=self._client_kwargs,
         )
         self._generation_kwargs: OpenAIResponses.GenerationKwargs = {}
+
+    @property
+    def client(self) -> AsyncOpenAI:
+        """The underlying AsyncOpenAI client (e.g. for live API-key updates)."""
+        return self._client
 
     @property
     def model_name(self) -> str:
@@ -156,11 +165,20 @@ class OpenAIResponses:
         history: Sequence[Message],
     ) -> "OpenAIResponsesStreamedMessage":
         inputs: ResponseInputParam = []
-        if system_prompt:
-            system_message: ResponseInputItemParam = {"role": "system", "content": system_prompt}
-            if is_openai_model(self.model_name):
-                system_message["role"] = "developer"
-            inputs.append(system_message)
+        if self._instructions_mode:
+            # Backends like chatgpt.com/backend-api/codex require `instructions` as a
+            # separate top-level field; they reject system/developer messages in `input`.
+            extra_instructions: str | None = system_prompt or None
+        else:
+            extra_instructions = None
+            if system_prompt:
+                system_message: ResponseInputItemParam = {
+                    "role": "system",
+                    "content": system_prompt,
+                }
+                if is_openai_model(self.model_name):
+                    system_message["role"] = "developer"
+                inputs.append(system_message)
         # The `Message` type is OpenAI-compatible for Responses API `input` messages.
 
         for message in history:
@@ -175,6 +193,8 @@ class OpenAIResponses:
                 summary="auto",
             )
             generation_kwargs["include"] = ["reasoning.encrypted_content"]
+        if extra_instructions is not None:
+            generation_kwargs["instructions"] = extra_instructions
 
         try:
             response = await self._client.responses.create(
@@ -191,11 +211,14 @@ class OpenAIResponses:
 
     def on_retryable_error(self, error: BaseException) -> bool:
         old_client = self._client
+        # Read api_key from the live client so live OAuth token mutations are preserved.
+        current_api_key = old_client.api_key
         self._client = create_openai_client(
-            api_key=self._api_key,
+            api_key=current_api_key,
             base_url=self._base_url,
             client_kwargs=self._client_kwargs,
         )
+        self._api_key = current_api_key
         close_replaced_openai_client(old_client, client_kwargs=self._client_kwargs)
         return True
 

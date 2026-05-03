@@ -170,10 +170,16 @@ def create_llm(
         case "openai_responses":
             from kosong.contrib.chat_provider.openai_responses import OpenAIResponses
 
+            # The ChatGPT Codex backend requires system_prompt as a top-level
+            # `instructions` field; the standard OpenAI API uses a developer message.
+            _chatgpt_backend = (provider.base_url or "").startswith(
+                "https://chatgpt.com/backend-api"
+            )
             chat_provider = OpenAIResponses(
                 model=model.model,
                 base_url=provider.base_url,
                 api_key=resolved_api_key,
+                instructions_mode=_chatgpt_backend,
                 default_headers=dict(provider.custom_headers) if provider.custom_headers else None,
             )
         case "anthropic":

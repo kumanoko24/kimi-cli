@@ -6,7 +6,7 @@ from typing import Any, NamedTuple, cast
 import aiohttp
 from pydantic import BaseModel
 
-from kimi_cli.auth import KIMI_CODE_PLATFORM_ID
+from kimi_cli.auth import KIMI_CODE_PLATFORM_ID, OPENAI_CODEX_PLATFORM_ID
 from kimi_cli.config import Config, LLMModel, load_config, save_config
 from kimi_cli.llm import ModelCapability
 from kimi_cli.utils.aiohttp import new_client_session
@@ -75,6 +75,14 @@ PLATFORMS: list[Platform] = [
         name="Moonshot AI Open Platform (moonshot.ai)",
         base_url="https://api.moonshot.ai/v1",
         allowed_prefixes=["kimi-k"],
+    ),
+    Platform(
+        id=OPENAI_CODEX_PLATFORM_ID,
+        name="OpenAI Codex (ChatGPT subscription)",
+        base_url="https://chatgpt.com/backend-api/codex",
+        # No search/fetch endpoints; restrict model enumeration to known prefixes
+        # so refresh_managed_models does not pollute config with incompatible models.
+        allowed_prefixes=["gpt-", "o3", "o4", "codex"],
     ),
 ]
 
