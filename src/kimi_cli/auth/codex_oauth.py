@@ -17,11 +17,14 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import secrets
 import time
 import webbrowser
 from collections.abc import AsyncIterator
-from typing import Any
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
 from urllib.parse import urlencode
 
 import aiohttp
@@ -56,6 +59,83 @@ _DEFAULT_CONTEXT = 128_000
 _CALLBACK_TIMEOUT_SECONDS = 300.0
 
 
+@dataclass(frozen=True)
+class ImportedCodexAuth:
+    account_id: str | None
+    path: Path
+
+
+def _codex_auth_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    if codex_home := os.getenv("CODEX_HOME"):
+        candidates.append(Path(codex_home).expanduser() / "auth.json")
+    home = Path.home()
+    candidates.extend(
+        [
+            home / ".codex" / "auth.json",
+            home / ".codex-atk" / "auth.json",
+            home / ".codex-leo" / "auth.json",
+        ]
+    )
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in candidates:
+        resolved = path.expanduser()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+    return unique
+
+
+def _load_codex_cli_auth(path: Path) -> tuple[OAuthToken, str | None] | None:
+    try:
+        raw_payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw_payload, dict):
+        return None
+    payload = cast(dict[str, Any], raw_payload)
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    tokens = cast(dict[str, Any], tokens)
+    access_token = str(tokens.get("access_token") or "")
+    refresh_token_value = str(tokens.get("refresh_token") or "")
+    if not access_token or not refresh_token_value:
+        return None
+    account_id = tokens.get("account_id")
+    token = OAuthToken(
+        access_token=access_token,
+        refresh_token=refresh_token_value,
+        # Codex auth.json does not carry access-token expiry. Force a refresh
+        # soon, while still allowing the current access token as an immediate fallback.
+        expires_at=0.0,
+        scope=OPENAI_CODEX_SCOPE,
+        token_type="Bearer",
+        expires_in=0.0,
+    )
+    return token, str(account_id) if account_id else None
+
+
+def import_openai_codex_cli_auth(oauth_ref: OAuthRef) -> ImportedCodexAuth | None:
+    """Import OpenAI Codex CLI auth.json tokens into Kimi's OAuth store.
+
+    This lets Kimi reuse Codex-family auth from CODEX_HOME, ~/.codex,
+    ~/.codex-atk, or ~/.codex-leo when ~/.kimi/credentials/openai-codex.json
+    is missing or stale.
+    """
+    for path in _codex_auth_candidates():
+        loaded = _load_codex_cli_auth(path)
+        if loaded is None:
+            continue
+        token, account_id = loaded
+        save_tokens(oauth_ref, token)
+        logger.info("Imported OpenAI Codex auth from {path}", path=str(path))
+        return ImportedCodexAuth(account_id=account_id, path=path)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # PKCE helpers
 # ---------------------------------------------------------------------------
@@ -88,7 +168,7 @@ def _parse_jwt_claims(token: str) -> dict[str, Any] | None:
     try:
         padding = "=" * (4 - len(parts[1]) % 4)
         payload = json.loads(base64.urlsafe_b64decode(parts[1] + padding))
-        return payload if isinstance(payload, dict) else None
+        return cast(dict[str, Any], payload) if isinstance(payload, dict) else None
     except Exception:
         return None
 
@@ -100,10 +180,14 @@ def _extract_account_id(id_token: str | None) -> str | None:
     if not claims:
         return None
     auth_block_raw = claims.get("https://api.openai.com/auth")
-    auth_block: dict[str, Any] = auth_block_raw if isinstance(auth_block_raw, dict) else {}
+    auth_block = cast(dict[str, Any], auth_block_raw) if isinstance(auth_block_raw, dict) else {}
     orgs_raw = claims.get("organizations")
-    orgs: list[dict[str, Any]] = orgs_raw if isinstance(orgs_raw, list) else []
-    first_org_id = orgs[0].get("id") if orgs and isinstance(orgs[0], dict) else None
+    orgs: list[dict[str, Any]] = []
+    if isinstance(orgs_raw, list):
+        for org_raw in cast(list[Any], orgs_raw):
+            if isinstance(org_raw, dict):
+                orgs.append(cast(dict[str, Any], org_raw))
+    first_org_id = orgs[0].get("id") if orgs else None
     return claims.get("chatgpt_account_id") or auth_block.get("chatgpt_account_id") or first_org_id
 
 
@@ -199,7 +283,7 @@ async def _wait_for_callback(
 def _assert_dict_response(data: Any, context: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise OAuthError(f"Unexpected response shape in {context}: {type(data).__name__}")
-    return data
+    return cast(dict[str, Any], data)
 
 
 async def _exchange_code(code: str, verifier: str) -> tuple[OAuthToken, str | None]:
@@ -325,7 +409,7 @@ async def _poll_device_token(
                 logger.warning("Unexpected device polling response shape, retrying")
                 continue
 
-            data: dict[str, Any] = raw
+            data = cast(dict[str, Any], raw)
             if status == 200 and "access_token" in data:
                 return OAuthToken.from_response(data)
 

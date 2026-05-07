@@ -9,7 +9,7 @@ Use this tool when:
 
 - **opencode**: OpenCode — strong at TypeScript/JavaScript projects, complex multi-file refactors, and full-repo reasoning. Uses `opencode acp` server mode; supports streaming tool calls back to kimi's UI.
 - **qwen**: Qwen Code (Alibaba) — alternative coding model, useful for cross-validation or when a different perspective is valuable. Uses `qwen --acp` server mode.
-- **codex**: OpenAI Codex CLI — good for focused, one-shot code tasks. Runs `codex exec` non-interactively.
+- **codex**: OpenAI Codex CLI — good for focused, one-shot code tasks. Runs `codex exec` non-interactively. Supports `model_id` (e.g. `o3`, `codex-mini-latest`) and `effort` (`low`/`medium`/`high` reasoning effort).
 
 ## Guidelines
 

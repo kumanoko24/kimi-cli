@@ -43,8 +43,17 @@ class Params(BaseModel):
     model_id: str | None = Field(
         default=None,
         description=(
-            "Optional model override for opencode/qwen, e.g. 'lmstudio/qwen3.5-4b'. "
-            "If omitted, the agent uses its configured default model."
+            "Model to use. opencode/qwen: e.g. 'lmstudio/qwen3.5-4b' "
+            "(calls set_session_model). codex: e.g. 'o3', 'codex-mini-latest' "
+            "(maps to -m flag). Omit to use the agent's configured default."
+        ),
+    )
+    effort: Literal["low", "medium", "high"] | None = Field(
+        default=None,
+        description=(
+            "Reasoning effort for codex (maps to model_reasoning_effort config). "
+            "Use 'high' for complex tasks, 'low' for quick answers. "
+            "Only applies to codex; ignored for opencode/qwen."
         ),
     )
 
@@ -80,4 +89,6 @@ class DelegateAgent(CallableTool2[Params]):
                 task=params.task,
                 cwd=cwd,
                 timeout=params.timeout_seconds,
+                model_id=params.model_id,
+                effort=params.effort,
             )

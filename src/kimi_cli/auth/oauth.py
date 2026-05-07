@@ -754,6 +754,7 @@ class OAuthManager:
         self._access_tokens: dict[str, str] = {}
         self._refresh_lock = asyncio.Lock()
         self._migrate_oauth_storage()
+        self._import_openai_codex_cli_auth_if_needed(None)
         self._load_initial_tokens()
 
     def _iter_oauth_refs(self) -> list[OAuthRef]:
@@ -882,6 +883,78 @@ class OAuthManager:
             return provider.oauth
         return None
 
+    def _apply_openai_codex_account_id(
+        self, runtime: Runtime | None, account_id: str | None
+    ) -> None:
+        if not account_id:
+            return
+        provider_key = managed_provider_key(OPENAI_CODEX_PLATFORM_ID)
+        provider = self._config.providers.get(provider_key)
+        if provider is None:
+            return
+        provider.custom_headers = {
+            **(provider.custom_headers or {}),
+            "ChatGPT-Account-Id": account_id,
+        }
+        self._apply_openai_codex_live_headers(runtime)
+
+    def _apply_openai_codex_live_headers(self, runtime: Runtime | None) -> None:
+        if runtime is None or runtime.llm is None or runtime.llm.model_config is None:
+            return
+        provider_key = managed_provider_key(OPENAI_CODEX_PLATFORM_ID)
+        if runtime.llm.model_config.provider != provider_key:
+            return
+        provider = runtime.config.providers.get(provider_key)
+        if provider is None:
+            return
+
+        from kosong.chat_provider.openai_common import (
+            close_replaced_openai_client,
+            create_openai_client,
+        )
+        from kosong.contrib.chat_provider.openai_responses import OpenAIResponses
+
+        chat_provider = runtime.llm.chat_provider
+        if not isinstance(chat_provider, OpenAIResponses):
+            return
+
+        client_kwargs = dict(
+            chat_provider._client_kwargs  # pyright: ignore[reportPrivateUsage]
+        )
+        if provider.custom_headers:
+            client_kwargs["default_headers"] = dict(provider.custom_headers)
+        else:
+            client_kwargs.pop("default_headers", None)
+
+        old_client = chat_provider.client
+        current_api_key = old_client.api_key
+        chat_provider._client_kwargs = client_kwargs  # pyright: ignore[reportPrivateUsage]
+        chat_provider._client = create_openai_client(  # pyright: ignore[reportPrivateUsage]
+            api_key=current_api_key,
+            base_url=chat_provider._base_url,  # pyright: ignore[reportPrivateUsage]
+            client_kwargs=client_kwargs,
+        )
+        chat_provider._api_key = current_api_key  # pyright: ignore[reportPrivateUsage]
+        close_replaced_openai_client(old_client, client_kwargs=client_kwargs)
+
+    def _import_openai_codex_cli_auth(self, ref: OAuthRef, runtime: Runtime | None) -> bool:
+        from kimi_cli.auth.codex_oauth import import_openai_codex_cli_auth
+
+        imported = import_openai_codex_cli_auth(ref)
+        if imported is None:
+            return False
+        self._apply_openai_codex_account_id(runtime, imported.account_id)
+        return True
+
+    def _import_openai_codex_cli_auth_if_needed(self, runtime: Runtime | None) -> bool:
+        ref = self._openai_codex_ref()
+        if ref is None:
+            return False
+        token = load_tokens(ref)
+        if token is not None and not self._should_suppress_persisted_token(ref, token):
+            return False
+        return self._import_openai_codex_cli_auth(ref, runtime)
+
     async def _ensure_fresh_provider(
         self,
         runtime: Runtime | None,
@@ -934,13 +1007,26 @@ class OAuthManager:
         if codex_ref is not None:
             from kimi_cli.auth.codex_oauth import refresh_openai_codex_token
 
-            await self._ensure_fresh_provider(
-                runtime,
-                codex_ref,
-                force=force,
-                platform_id=OPENAI_CODEX_PLATFORM_ID,
-                refresh_fn=refresh_openai_codex_token,
-            )
+            self._import_openai_codex_cli_auth_if_needed(runtime)
+
+            try:
+                await self._ensure_fresh_provider(
+                    runtime,
+                    codex_ref,
+                    force=force,
+                    platform_id=OPENAI_CODEX_PLATFORM_ID,
+                    refresh_fn=refresh_openai_codex_token,
+                )
+            except OAuthUnauthorized:
+                if not force or not self._import_openai_codex_cli_auth(codex_ref, runtime):
+                    raise
+                await self._ensure_fresh_provider(
+                    runtime,
+                    codex_ref,
+                    force=force,
+                    platform_id=OPENAI_CODEX_PLATFORM_ID,
+                    refresh_fn=refresh_openai_codex_token,
+                )
 
     @asynccontextmanager
     async def refreshing(self, runtime: Runtime) -> AsyncIterator[None]:

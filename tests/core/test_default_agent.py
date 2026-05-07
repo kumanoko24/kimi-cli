@@ -209,7 +209,9 @@ At any time, you should be HELPFUL, CONCISE, and ACCURATE. Be thorough in your a
                     "kimi_cli.tools.file:WriteFile",
                     "kimi_cli.tools.file:StrReplaceFile",
                     "kimi_cli.tools.web:SearchWeb",
-                    "kimi_cli.tools.web:FetchURL", "kimi_cli.tools.delegate_agent:DelegateAgent"),
+                    "kimi_cli.tools.web:FetchURL",
+                    "kimi_cli.tools.delegate_agent:DelegateAgent",
+                ),
             ),
             (
                 "explore",
@@ -274,7 +276,9 @@ async def test_default_agent_background_bash_guardrails(runtime: Runtime):
             "SearchWeb",
             "FetchURL",
             "ExitPlanMode",
-            "EnterPlanMode", "DelegateAgent"]
+            "EnterPlanMode",
+            "DelegateAgent",
+        ]
     )
     assert agent.toolset.tools[0].description == snapshot(
         """\

@@ -7,7 +7,7 @@ import contextlib
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import acp
 import acp.schema as acps
@@ -80,7 +80,7 @@ class _ACPBridgeClient:
                 subagent_type=None,
                 event=event,
             )
-            asyncio.get_event_loop().create_task(wire.soul_side.send(msg))
+            wire.soul_side.send(msg)
         except Exception as exc:
             logger.debug("SubagentEvent send skipped: {error}", error=exc)
 
@@ -95,7 +95,7 @@ class _ACPBridgeClient:
             case "AgentThoughtChunk":
                 content = update.content
                 if isinstance(content, acps.TextContentBlock) and content.text:
-                    self._emit(ThinkPart(thinking=content.text))
+                    self._emit(ThinkPart(think=content.text))
             case "ToolCallStart":
                 tc_id = f"{self._agent_id}:{update.tool_call_id}"
                 self._emit(
@@ -125,6 +125,8 @@ class _ACPBridgeClient:
                         for k in ("total_tokens", "input_tokens", "output_tokens")
                         if getattr(used, k, None) is not None
                     }
+            case _:
+                pass
 
     async def request_permission(
         self,
@@ -201,75 +203,82 @@ def _make_raw_observer(bridge: _ACPBridgeClient) -> Any:
     def observer(evt: Any) -> None:
         if evt.direction != StreamDirection.INCOMING:
             return
-        msg = evt.message
+        msg = cast(dict[str, Any], evt.message)
         if msg.get("method") != "session/update":
             return
-        params = msg.get("params") or {}
-        session_id = params.get("sessionId") or params.get("session_id") or ""
-        update_raw = params.get("update") or {}
-        if not isinstance(update_raw, dict):
+        params_obj: Any = msg.get("params")
+        if not isinstance(params_obj, dict):
             return
-        update_type = update_raw.get("type") or update_raw.get("session_update") or ""
+        params = cast(dict[str, Any], params_obj)
+        session_id = str(params.get("sessionId") or params.get("session_id") or "")
+        update_obj: Any = params.get("update")
+        if not isinstance(update_obj, dict):
+            return
+        update_raw = cast(dict[str, Any], update_obj)
+        update_type = str(update_raw.get("type") or update_raw.get("session_update") or "")
 
         # Manually construct the typed update object the bridge expects.
         try:
             update: Any
             match update_type:
                 case "agent_message_chunk" | "AgentMessageChunk":
-                    content_raw = update_raw.get("content") or {}
-                    if isinstance(content_raw, dict) and content_raw.get("type") == "text":
+                    content_obj: Any = update_raw.get("content")
+                    if isinstance(content_obj, dict):
+                        content_raw = cast(dict[str, Any], content_obj)
+                    else:
+                        return
+                    if content_raw.get("type") == "text":
                         update = acps.AgentMessageChunk(
                             session_update="agent_message_chunk",
                             content=acps.TextContentBlock(
-                                type="text", text=content_raw.get("text", "")
+                                type="text", text=str(content_raw.get("text") or "")
                             ),
                         )
                     else:
                         return
                 case "agent_thought_chunk" | "AgentThoughtChunk":
-                    content_raw = update_raw.get("content") or {}
-                    if isinstance(content_raw, dict):
+                    content_obj: Any = update_raw.get("content")
+                    if isinstance(content_obj, dict):
+                        content_raw = cast(dict[str, Any], content_obj)
                         update = acps.AgentThoughtChunk(
                             session_update="agent_thought_chunk",
                             content=acps.TextContentBlock(
-                                type="text", text=content_raw.get("text", "")
+                                type="text", text=str(content_raw.get("text") or "")
                             ),
                         )
                     else:
                         return
                 case "tool_call" | "ToolCallStart":
-                    tc_id = (
-                        update_raw.get("toolCallId")
-                        or update_raw.get("tool_call_id")
-                        or ""
+                    tc_id = str(
+                        update_raw.get("toolCallId") or update_raw.get("tool_call_id") or ""
                     )
                     update = acps.ToolCallStart(
                         session_update="tool_call",
                         tool_call_id=tc_id,
-                        title=update_raw.get("title") or "tool",
-                        status=update_raw.get("status"),
-                        kind=update_raw.get("kind"),
+                        title=str(update_raw.get("title") or "tool"),
+                        status=cast(Any, update_raw.get("status")),
+                        kind=cast(Any, update_raw.get("kind")),
                         content=None,
                         locations=None,
                         raw_input=None,
                         raw_output=None,
                     )
                 case "tool_call_update" | "ToolCallProgress":
-                    tc_id = (
-                        update_raw.get("toolCallId")
-                        or update_raw.get("tool_call_id")
-                        or ""
+                    tc_id = str(
+                        update_raw.get("toolCallId") or update_raw.get("tool_call_id") or ""
                     )
                     update = acps.ToolCallProgress(
                         session_update="tool_call_update",
                         tool_call_id=tc_id,
-                        title=update_raw.get("title") or "tool",
-                        status=update_raw.get("status"),
-                        kind=update_raw.get("kind"),
+                        title=str(update_raw.get("title") or "tool"),
+                        status=cast(Any, update_raw.get("status")),
+                        kind=cast(Any, update_raw.get("kind")),
                         content=None,
                         locations=None,
                         raw_input=None,
-                        raw_output=update_raw.get("rawOutput") or update_raw.get("raw_output"),
+                        raw_output=cast(
+                            Any, update_raw.get("rawOutput") or update_raw.get("raw_output")
+                        ),
                     )
                 case "usage_update" | "UsageUpdate":
                     # Skip — not critical for text collection
@@ -311,7 +320,7 @@ async def run_acp(
 
     try:
         async with acp.spawn_agent_process(
-            lambda _conn: bridge,
+            lambda _conn: cast(Any, bridge),
             *config.command,
             cwd=cwd,
             transport_kwargs={"limit": 100 * 1024 * 1024},  # 100 MB — matches wire server
@@ -324,9 +333,7 @@ async def run_acp(
             )
             session = await conn.new_session(cwd=cwd)
             if model_id:
-                await conn.set_session_model(
-                    model_id=model_id, session_id=session.session_id
-                )
+                await conn.set_session_model(model_id=model_id, session_id=session.session_id)
             await asyncio.wait_for(
                 conn.prompt(
                     session_id=session.session_id,
@@ -348,12 +355,24 @@ async def run_acp(
     return ToolOk(output=text)
 
 
-async def run_codex_exec(task: str, cwd: str, timeout: int) -> ToolReturnValue:
+async def run_codex_exec(
+    task: str,
+    cwd: str,
+    timeout: int,
+    model_id: str | None = None,
+    effort: str | None = None,
+) -> ToolReturnValue:
+    cmd = ["codex", "exec"]
+    if model_id:
+        cmd += ["-m", model_id]
+    if effort:
+        cmd += ["-c", f'model_reasoning_effort="{effort}"']
+    cmd.append(task)
+    proc: asyncio.subprocess.Process | None = None
+
     try:
         proc = await asyncio.create_subprocess_exec(
-            "codex",
-            "exec",
-            task,
+            *cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -361,8 +380,9 @@ async def run_codex_exec(task: str, cwd: str, timeout: int) -> ToolReturnValue:
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=float(timeout))
     except TimeoutError:
-        with contextlib.suppress(Exception):
-            proc.kill()
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                proc.kill()
         return ToolError(message=f"codex timed out after {timeout}s.", brief="timeout")
     except FileNotFoundError:
         return ToolError(
