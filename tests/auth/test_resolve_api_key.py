@@ -312,6 +312,49 @@ def test_openai_codex_existing_token_hydrates_email_from_codex_cli_auth(tmp_path
     )
 
 
+def test_openai_codex_session_email_hydrates_missing_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIMI_SHARE_DIR", str(tmp_path / "kimi"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    (codex_home / "auth.json").write_text(
+        """
+        {
+          "tokens": {
+            "access_token": "codex-cli-access",
+            "refresh_token": "codex-cli-refresh",
+            "account_id": "chatgpt-account",
+            "email": "codex-user@example.com"
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    ref = OAuthRef(storage="file", key="oauth/openai-codex")
+    _save_to_file(
+        ref.key,
+        OAuthToken(
+            access_token="existing-access",
+            refresh_token="existing-refresh",
+            expires_at=time.time() + 3600,
+            scope="",
+            token_type="Bearer",
+        ),
+    )
+
+    config = _make_openai_codex_config()
+    provider = config.providers[managed_provider_key(OPENAI_CODEX_PLATFORM_ID)]
+    provider.custom_headers = {"ChatGPT-Account-Id": "chatgpt-account"}
+
+    assert openai_codex_session_email(config, config.models[config.default_model]) == (
+        "codex-user@example.com"
+    )
+    stored = load_tokens(ref)
+    assert stored is not None
+    assert stored.metadata["email"] == "codex-user@example.com"
+
+
 def test_openai_codex_session_email_requires_active_codex_model(tmp_path, monkeypatch):
     monkeypatch.setenv("KIMI_SHARE_DIR", str(tmp_path / "kimi"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))

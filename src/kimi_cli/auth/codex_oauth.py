@@ -278,6 +278,20 @@ def openai_codex_session_email(config: Config, model: LLMModel | None) -> str | 
     token = load_tokens(provider.oauth)
     if token is None:
         return None
+    if email := token.metadata.get("email"):
+        return email
+
+    account_id = None
+    if provider.custom_headers:
+        account_id = provider.custom_headers.get("ChatGPT-Account-Id")
+    metadata = find_openai_codex_cli_auth_metadata(account_id=account_id)
+    if not metadata:
+        return None
+
+    merged = {**metadata, **token.metadata}
+    if merged != token.metadata:
+        token.metadata = merged
+        save_tokens(provider.oauth, token)
     return token.metadata.get("email") or None
 
 
