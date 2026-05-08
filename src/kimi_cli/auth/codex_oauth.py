@@ -37,6 +37,7 @@ from kimi_cli.auth.oauth import (
     OAuthToken,
     OAuthUnauthorized,
     delete_tokens,
+    load_tokens,
     save_tokens,
 )
 from kimi_cli.auth.platforms import managed_model_key, managed_provider_key
@@ -62,6 +63,7 @@ _CALLBACK_TIMEOUT_SECONDS = 300.0
 @dataclass(frozen=True)
 class ImportedCodexAuth:
     account_id: str | None
+    email: str | None
     path: Path
 
 
@@ -104,7 +106,8 @@ def _load_codex_cli_auth(path: Path) -> tuple[OAuthToken, str | None] | None:
     refresh_token_value = str(tokens.get("refresh_token") or "")
     if not access_token or not refresh_token_value:
         return None
-    account_id = tokens.get("account_id")
+    metadata = _codex_auth_metadata(payload, tokens)
+    account_id = metadata.get("account_id") or _string_or_none(tokens.get("account_id"))
     token = OAuthToken(
         access_token=access_token,
         refresh_token=refresh_token_value,
@@ -114,8 +117,9 @@ def _load_codex_cli_auth(path: Path) -> tuple[OAuthToken, str | None] | None:
         scope=OPENAI_CODEX_SCOPE,
         token_type="Bearer",
         expires_in=0.0,
+        metadata=metadata,
     )
-    return token, str(account_id) if account_id else None
+    return token, account_id
 
 
 def import_openai_codex_cli_auth(oauth_ref: OAuthRef) -> ImportedCodexAuth | None:
@@ -132,7 +136,28 @@ def import_openai_codex_cli_auth(oauth_ref: OAuthRef) -> ImportedCodexAuth | Non
         token, account_id = loaded
         save_tokens(oauth_ref, token)
         logger.info("Imported OpenAI Codex auth from {path}", path=str(path))
-        return ImportedCodexAuth(account_id=account_id, path=path)
+        return ImportedCodexAuth(
+            account_id=account_id,
+            email=token.metadata.get("email"),
+            path=path,
+        )
+    return None
+
+
+def find_openai_codex_cli_auth_metadata(*, account_id: str | None = None) -> dict[str, str] | None:
+    """Return display metadata from a local Codex auth session without importing tokens."""
+    for path in _codex_auth_candidates():
+        loaded = _load_codex_cli_auth(path)
+        if loaded is None:
+            continue
+        token, loaded_account_id = loaded
+        metadata = token.metadata
+        if not metadata:
+            continue
+        metadata_account_id = loaded_account_id or metadata.get("account_id")
+        if account_id and metadata_account_id and metadata_account_id != account_id:
+            continue
+        return dict(metadata)
     return None
 
 
@@ -173,6 +198,13 @@ def _parse_jwt_claims(token: str) -> dict[str, Any] | None:
         return None
 
 
+def _string_or_none(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
 def _extract_account_id(id_token: str | None) -> str | None:
     if not id_token:
         return None
@@ -189,6 +221,64 @@ def _extract_account_id(id_token: str | None) -> str | None:
                 orgs.append(cast(dict[str, Any], org_raw))
     first_org_id = orgs[0].get("id") if orgs else None
     return claims.get("chatgpt_account_id") or auth_block.get("chatgpt_account_id") or first_org_id
+
+
+def _extract_email(id_token: str | None) -> str | None:
+    if not id_token:
+        return None
+    claims = _parse_jwt_claims(id_token)
+    if not claims:
+        return None
+    auth_block_raw = claims.get("https://api.openai.com/auth")
+    auth_block = cast(dict[str, Any], auth_block_raw) if isinstance(auth_block_raw, dict) else {}
+    return _string_or_none(claims.get("email")) or _string_or_none(auth_block.get("email"))
+
+
+def _metadata_from_id_token(id_token: str | None) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    if account_id := _extract_account_id(id_token):
+        metadata["account_id"] = account_id
+    if email := _extract_email(id_token):
+        metadata["email"] = email
+    return metadata
+
+
+def _codex_auth_metadata(payload: dict[str, Any], tokens: dict[str, Any]) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    if account_id := _string_or_none(tokens.get("account_id")):
+        metadata["account_id"] = account_id
+    if email := (
+        _string_or_none(tokens.get("email"))
+        or _string_or_none(tokens.get("account_email"))
+        or _string_or_none(payload.get("email"))
+        or _string_or_none(payload.get("account_email"))
+    ):
+        metadata["email"] = email
+    id_token = _string_or_none(tokens.get("id_token")) or _string_or_none(payload.get("id_token"))
+    metadata.update(_metadata_from_id_token(id_token))
+    return metadata
+
+
+def _codex_token_from_response(data: dict[str, Any]) -> OAuthToken:
+    token = OAuthToken.from_response(data)
+    token.metadata = _metadata_from_id_token(_string_or_none(data.get("id_token")))
+    return token
+
+
+def openai_codex_session_email(config: Config, model: LLMModel | None) -> str | None:
+    """Return the active OpenAI Codex OAuth session email for display."""
+    if model is None:
+        return None
+    provider_key = managed_provider_key(OPENAI_CODEX_PLATFORM_ID)
+    if model.provider != provider_key:
+        return None
+    provider = config.providers.get(provider_key)
+    if provider is None or provider.type != "openai_responses" or provider.oauth is None:
+        return None
+    token = load_tokens(provider.oauth)
+    if token is None:
+        return None
+    return token.metadata.get("email") or None
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +401,7 @@ async def _exchange_code(code: str, verifier: str) -> tuple[OAuthToken, str | No
     if status != 200:
         raise OAuthError(f"Token exchange failed: {data.get('error_description') or data}")
     id_token: str | None = data.get("id_token")
-    return OAuthToken.from_response(data), id_token
+    return _codex_token_from_response(data), id_token
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +432,7 @@ async def refresh_openai_codex_token(refresh_token_value: str) -> OAuthToken:
         raise OAuthUnauthorized(data.get("error_description") or "Token refresh unauthorized.")
     if status != 200:
         raise OAuthError(data.get("error_description") or f"Token refresh failed (HTTP {status}).")
-    return OAuthToken.from_response(data)
+    return _codex_token_from_response(data)
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +501,7 @@ async def _poll_device_token(
 
             data = cast(dict[str, Any], raw)
             if status == 200 and "access_token" in data:
-                return OAuthToken.from_response(data)
+                return _codex_token_from_response(data)
 
             error = str(data.get("error") or "")
             if error == "authorization_pending":
@@ -553,7 +643,7 @@ async def login_openai_codex(
             yield OAuthEvent("waiting", "Waiting for browser authorization...")
             code = await _wait_for_callback(state)
             token, id_token = await _exchange_code(code, verifier)
-            account_id = _extract_account_id(id_token)
+            account_id = token.metadata.get("account_id") or _extract_account_id(id_token)
         except Exception as exc:
             yield OAuthEvent("error", f"Login failed: {exc}")
             return

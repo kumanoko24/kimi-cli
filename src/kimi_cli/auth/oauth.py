@@ -13,7 +13,7 @@ import uuid
 import webbrowser
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -102,6 +102,10 @@ class OAuthEvent:
         return json.dumps(payload, ensure_ascii=False)
 
 
+def _empty_metadata() -> dict[str, str]:
+    return {}
+
+
 @dataclass(slots=True)
 class OAuthToken:
     access_token: str
@@ -110,6 +114,7 @@ class OAuthToken:
     scope: str
     token_type: str
     expires_in: float = 0.0
+    metadata: dict[str, str] = field(default_factory=_empty_metadata)
 
     @classmethod
     def from_response(cls, payload: dict[str, Any]) -> OAuthToken:
@@ -124,7 +129,7 @@ class OAuthToken:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
             "expires_at": self.expires_at,
@@ -132,10 +137,21 @@ class OAuthToken:
             "token_type": self.token_type,
             "expires_in": self.expires_in,
         }
+        if self.metadata:
+            data["metadata"] = self.metadata
+        return data
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> OAuthToken:
         expires_at_value = payload.get("expires_at")
+        raw_metadata = payload.get("metadata")
+        metadata: dict[str, str] = {}
+        if isinstance(raw_metadata, dict):
+            metadata = {
+                str(key): str(value)
+                for key, value in cast(dict[Any, Any], raw_metadata).items()
+                if value is not None
+            }
         return cls(
             access_token=str(payload.get("access_token") or ""),
             refresh_token=str(payload.get("refresh_token") or ""),
@@ -143,6 +159,7 @@ class OAuthToken:
             scope=str(payload.get("scope") or ""),
             token_type=str(payload.get("token_type") or ""),
             expires_in=float(payload.get("expires_in") or 0),
+            metadata=metadata,
         )
 
 
@@ -898,6 +915,33 @@ class OAuthManager:
         }
         self._apply_openai_codex_live_headers(runtime)
 
+    def _openai_codex_account_id(self) -> str | None:
+        provider = self._config.providers.get(managed_provider_key(OPENAI_CODEX_PLATFORM_ID))
+        if provider is None or not provider.custom_headers:
+            return None
+        value = provider.custom_headers.get("ChatGPT-Account-Id")
+        return value if value else None
+
+    def _hydrate_openai_codex_metadata(
+        self,
+        ref: OAuthRef,
+        token: OAuthToken,
+        runtime: Runtime | None,
+    ) -> None:
+        if token.metadata.get("email"):
+            return
+        from kimi_cli.auth.codex_oauth import find_openai_codex_cli_auth_metadata
+
+        metadata = find_openai_codex_cli_auth_metadata(account_id=self._openai_codex_account_id())
+        if not metadata:
+            return
+        merged = {**metadata, **token.metadata}
+        if merged == token.metadata:
+            return
+        token.metadata = merged
+        save_tokens(ref, token)
+        self._apply_openai_codex_account_id(runtime, merged.get("account_id"))
+
     def _apply_openai_codex_live_headers(self, runtime: Runtime | None) -> None:
         if runtime is None or runtime.llm is None or runtime.llm.model_config is None:
             return
@@ -952,6 +996,7 @@ class OAuthManager:
             return False
         token = load_tokens(ref)
         if token is not None and not self._should_suppress_persisted_token(ref, token):
+            self._hydrate_openai_codex_metadata(ref, token, runtime)
             return False
         return self._import_openai_codex_cli_auth(ref, runtime)
 
@@ -1195,6 +1240,8 @@ class OAuthManager:
                     track("oauth_refresh", success=False, reason="network_or_other")
                     return
                 self._clear_rejected_refresh_token(ref)
+                if current.metadata and not refreshed.metadata:
+                    refreshed.metadata = dict(current.metadata)
                 save_tokens(ref, refreshed)
                 self._cache_access_token(ref, refreshed)
                 self._apply_access_token(runtime, refreshed.access_token, platform_id=platform_id)
