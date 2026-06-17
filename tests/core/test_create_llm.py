@@ -393,6 +393,59 @@ def test_create_llm_openai_responses_thinking_false_no_reasoning_in_params():
     )
 
 
+def test_create_llm_openai_responses_honors_model_thinking_effort():
+    provider = LLMProvider(
+        type="openai_responses",
+        base_url="https://api.openai.com/v1",
+        api_key=SecretStr("test-key"),
+    )
+    model = LLMModel(
+        provider="openai",
+        model="gpt-5.5",
+        max_context_size=400_000,
+        capabilities={"thinking"},
+        thinking_effort="xhigh",
+    )
+
+    llm = create_llm(provider, model, thinking=True)
+
+    assert llm is not None
+    assert isinstance(llm.chat_provider, OpenAIResponses)
+    assert llm.chat_provider.thinking_effort == "xhigh"
+    assert llm.chat_provider.model_parameters == snapshot(
+        {
+            "base_url": "https://api.openai.com/v1/",
+            "reasoning_effort": "xhigh",
+        }
+    )
+
+
+def test_create_llm_openai_codex_gpt55_defaults_to_xhigh():
+    provider = LLMProvider(
+        type="openai_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key=SecretStr("test-key"),
+    )
+    model = LLMModel(
+        provider="managed:openai-codex",
+        model="gpt-5.5",
+        max_context_size=400_000,
+        capabilities={"thinking", "always_thinking", "image_in"},
+    )
+
+    llm = create_llm(provider, model, thinking=None)
+
+    assert llm is not None
+    assert isinstance(llm.chat_provider, OpenAIResponses)
+    assert llm.chat_provider.thinking_effort == "xhigh"
+    assert llm.chat_provider.model_parameters == snapshot(
+        {
+            "base_url": "https://chatgpt.com/backend-api/codex/",
+            "reasoning_effort": "xhigh",
+        }
+    )
+
+
 def _make_kimi_thinking_model() -> tuple[LLMProvider, LLMModel]:
     """Helper: build a kimi provider + always-thinking model pair."""
     provider = LLMProvider(

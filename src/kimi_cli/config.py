@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal, Self
 
 import tomlkit
+from kosong.chat_provider import ThinkingEffort
 from pydantic import (
     AliasChoices,
     BaseModel,
@@ -70,6 +71,8 @@ class LLMModel(BaseModel):
     """Model capabilities"""
     display_name: str | None = None
     """Human-readable model name (sourced from the provider's models API when available)"""
+    thinking_effort: ThinkingEffort | None = None
+    """Default thinking effort when thinking mode is enabled for this model."""
 
 
 class LoopControl(BaseModel):

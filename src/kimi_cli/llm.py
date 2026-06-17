@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast, get_args
 
-from kosong.chat_provider import ChatProvider
+from kosong.chat_provider import ChatProvider, ThinkingEffort
 from pydantic import SecretStr
 
 from kimi_cli.constant import USER_AGENT
@@ -54,6 +54,18 @@ def model_display_name(model_name: str | None, model: LLMModel | None = None) ->
     if model_name in ("kimi-for-coding", "kimi-code"):
         return "kimi-for-coding"
     return model_name
+
+
+def _enabled_thinking_effort(provider: LLMProvider, model: LLMModel) -> ThinkingEffort:
+    if model.thinking_effort and model.thinking_effort != "off":
+        return model.thinking_effort
+    if (
+        provider.type == "openai_responses"
+        and (provider.base_url or "").startswith("https://chatgpt.com/backend-api")
+        and model.model == "gpt-5.5"
+    ):
+        return "xhigh"
+    return "high"
 
 
 def augment_provider_with_env_vars(provider: LLMProvider, model: LLMModel) -> dict[str, str]:
@@ -250,7 +262,7 @@ def create_llm(
         thinking is True and "thinking" in capabilities
     )
     if thinking_on:
-        chat_provider = chat_provider.with_thinking("high")
+        chat_provider = chat_provider.with_thinking(_enabled_thinking_effort(provider, model))
     elif thinking is False:
         chat_provider = chat_provider.with_thinking("off")
     # If thinking is None and model doesn't always think, leave as-is (default behavior)

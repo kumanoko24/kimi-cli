@@ -51,14 +51,21 @@ def _make_config(*, with_oauth: bool = True, api_key: str = "") -> Config:
 
 def _make_openai_codex_config() -> Config:
     provider_key = managed_provider_key(OPENAI_CODEX_PLATFORM_ID)
-    model_key = managed_model_key(OPENAI_CODEX_PLATFORM_ID, "codex-mini-latest")
+    model_key = managed_model_key(OPENAI_CODEX_PLATFORM_ID, "gpt-5.5")
     provider = LLMProvider(
         type="openai_responses",
         base_url="https://chatgpt.com/backend-api/codex",
         api_key=SecretStr(""),
         oauth=OAuthRef(storage="file", key="oauth/openai-codex"),
     )
-    model = LLMModel(provider=provider_key, model="codex-mini-latest", max_context_size=128_000)
+    model = LLMModel(
+        provider=provider_key,
+        model="gpt-5.5",
+        max_context_size=400_000,
+        capabilities={"thinking", "always_thinking", "image_in"},
+        thinking_effort="xhigh",
+        display_name="OpenAI Codex (gpt-5.5)",
+    )
     return Config(
         default_model=model_key,
         providers={provider_key: provider},
@@ -420,15 +427,15 @@ def test_openai_codex_account_id_updates_live_openai_client(tmp_path, monkeypatc
     config = _make_openai_codex_config()
     oauth = OAuthManager(config)
     provider_key = managed_provider_key(OPENAI_CODEX_PLATFORM_ID)
-    model_key = managed_model_key(OPENAI_CODEX_PLATFORM_ID, "codex-mini-latest")
+    model_key = managed_model_key(OPENAI_CODEX_PLATFORM_ID, "gpt-5.5")
     chat_provider = OpenAIResponses(
-        model="codex-mini-latest",
+        model="gpt-5.5",
         base_url="https://chatgpt.com/backend-api/codex",
         api_key="access-token",
     )
     llm = LLM(
         chat_provider=chat_provider,
-        max_context_size=128_000,
+        max_context_size=400_000,
         capabilities=set(),
         model_config=config.models[model_key],
         provider_config=config.providers[provider_key],

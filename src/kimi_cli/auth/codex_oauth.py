@@ -55,8 +55,9 @@ OPENAI_CODEX_OAUTH_PORT = 1455
 OPENAI_CODEX_REDIRECT_URI = f"http://127.0.0.1:{OPENAI_CODEX_OAUTH_PORT}/callback"
 OPENAI_CODEX_SCOPE = "openid profile email offline_access"
 # Model IDs served by the ChatGPT Codex backend (update as OpenAI releases new versions).
-_DEFAULT_MODEL = "codex-mini-latest"
-_DEFAULT_CONTEXT = 128_000
+_DEFAULT_MODEL = "gpt-5.5"
+_DEFAULT_CONTEXT = 400_000
+_DEFAULT_THINKING_EFFORT = "xhigh"
 _CALLBACK_TIMEOUT_SECONDS = 300.0
 
 
@@ -567,6 +568,7 @@ def _apply_openai_codex_config(
         model=_DEFAULT_MODEL,
         max_context_size=_DEFAULT_CONTEXT,
         capabilities={"thinking", "always_thinking"},
+        thinking_effort=_DEFAULT_THINKING_EFFORT,
         display_name=f"OpenAI Codex ({_DEFAULT_MODEL})",
     )
 

@@ -48,11 +48,11 @@ class Params(BaseModel):
             "(maps to -m flag). Omit to use the agent's configured default."
         ),
     )
-    effort: Literal["low", "medium", "high"] | None = Field(
+    effort: Literal["low", "medium", "high", "xhigh"] | None = Field(
         default=None,
         description=(
             "Reasoning effort for codex (maps to model_reasoning_effort config). "
-            "Use 'high' for complex tasks, 'low' for quick answers. "
+            "Use 'high' or 'xhigh' for complex tasks, 'low' for quick answers. "
             "Only applies to codex; ignored for opencode/qwen."
         ),
     )

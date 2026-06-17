@@ -36,8 +36,8 @@ async def test_run_codex_exec_passes_model_and_effort(monkeypatch):
         task="review this",
         cwd="/tmp/project",
         timeout=30,
-        model_id="o3",
-        effort="high",
+        model_id="gpt-5.5",
+        effort="xhigh",
     )
 
     assert isinstance(result, ToolOk)
@@ -46,9 +46,9 @@ async def test_run_codex_exec_passes_model_and_effort(monkeypatch):
         "codex",
         "exec",
         "-m",
-        "o3",
+        "gpt-5.5",
         "-c",
-        'model_reasoning_effort="high"',
+        'model_reasoning_effort="xhigh"',
         "review this",
     )
     assert recorded["cwd"] == "/tmp/project"

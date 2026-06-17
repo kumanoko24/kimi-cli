@@ -4,6 +4,7 @@ import os
 from typing import Any, NamedTuple, cast
 
 import aiohttp
+from kosong.chat_provider import ThinkingEffort
 from pydantic import BaseModel
 
 from kimi_cli.auth import KIMI_CODE_PLATFORM_ID, OPENAI_CODEX_PLATFORM_ID
@@ -139,6 +140,12 @@ def _select_retry_api_keys(
             continue
         result.append(candidate)
     return result
+
+
+def _default_thinking_effort(platform_id: str, model: ModelInfo) -> ThinkingEffort | None:
+    if platform_id == OPENAI_CODEX_PLATFORM_ID and model.id == "gpt-5.5":
+        return "xhigh"
+    return None
 
 
 async def refresh_managed_models(config: Config) -> bool:
@@ -328,6 +335,7 @@ def _apply_models(
 
         existing = config.models.get(model_key)
         capabilities = model.capabilities or None  # empty set -> None
+        thinking_effort = _default_thinking_effort(platform_id, model)
 
         if existing is None:
             config.models[model_key] = LLMModel(
@@ -335,6 +343,7 @@ def _apply_models(
                 model=model.id,
                 max_context_size=model.context_length,
                 capabilities=capabilities,
+                thinking_effort=thinking_effort,
                 display_name=model.display_name,
             )
             changed = True
@@ -351,6 +360,9 @@ def _apply_models(
             changed = True
         if existing.capabilities != capabilities:
             existing.capabilities = capabilities
+            changed = True
+        if existing.thinking_effort != thinking_effort:
+            existing.thinking_effort = thinking_effort
             changed = True
         if existing.display_name != model.display_name:
             existing.display_name = model.display_name

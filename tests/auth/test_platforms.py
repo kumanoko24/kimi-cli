@@ -174,6 +174,26 @@ def test_apply_models_clears_display_name_when_api_drops_it():
     assert config.models["kimi-code/kimi-for-coding"].display_name is None
 
 
+def test_apply_models_sets_openai_codex_gpt55_xhigh_effort():
+    config = Config(services=Services())
+    models = [
+        ModelInfo(
+            id="gpt-5.5",
+            context_length=400_000,
+            supports_reasoning=True,
+            supports_image_in=True,
+            supports_video_in=False,
+            display_name="OpenAI Codex (gpt-5.5)",
+        )
+    ]
+
+    changed = _apply_models(config, "managed:openai-codex", "openai-codex", models)
+
+    assert changed is True
+    entry = config.models["openai-codex/gpt-5.5"]
+    assert entry.thinking_effort == "xhigh"
+
+
 # ── model_display_name: prefers LLMModel.display_name ────────────
 
 
