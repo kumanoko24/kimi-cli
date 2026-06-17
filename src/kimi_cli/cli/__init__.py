@@ -908,20 +908,52 @@ def login(
         "--json",
         help="Emit OAuth events as JSON lines.",
     ),
+    platform: str = typer.Option(
+        "kimi-code",
+        "--platform",
+        help="Platform to authenticate with. Choices: kimi-code, openai-codex.",
+    ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="Use device-code flow instead of browser (openai-codex only).",
+    ),
 ) -> None:
-    """Login to your Kimi account."""
+    """Login to your account (Kimi Code or OpenAI Codex)."""
     import asyncio
 
     from rich.console import Console
     from rich.status import Status
 
-    from kimi_cli.auth.oauth import login_kimi_code
+    from kimi_cli.auth import KIMI_CODE_PLATFORM_ID, OPENAI_CODEX_PLATFORM_ID
     from kimi_cli.config import load_config
 
+    _VALID_PLATFORMS = {KIMI_CODE_PLATFORM_ID, OPENAI_CODEX_PLATFORM_ID}
+    if platform not in _VALID_PLATFORMS:
+        typer.echo(
+            f"Unknown platform '{platform}'. Choose from: {', '.join(sorted(_VALID_PLATFORMS))}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if headless and platform != OPENAI_CODEX_PLATFORM_ID:
+        typer.echo("--headless is only valid with --platform openai-codex.", err=True)
+        raise typer.Exit(code=1)
+
     async def _run() -> bool:
+        # Construct a fresh generator in each branch to avoid re-iteration issues.
+        if platform == OPENAI_CODEX_PLATFORM_ID:
+            from kimi_cli.auth.codex_oauth import login_openai_codex
+
+            stream = login_openai_codex(load_config(), headless=headless)
+        else:
+            from kimi_cli.auth.oauth import login_kimi_code
+
+            stream = login_kimi_code(load_config())
+
         if json:
             ok = True
-            async for event in login_kimi_code(load_config()):
+            async for event in stream:
                 typer.echo(event.json)
                 if event.type == "error":
                     ok = False
@@ -931,10 +963,10 @@ def login(
         ok = True
         status: Status | None = None
         try:
-            async for event in login_kimi_code(load_config()):
+            async for event in stream:
                 if event.type == "waiting":
                     if status is None:
-                        status = console.status("Waiting for user authorization...")
+                        status = console.status("Waiting for authorization...")
                         status.start()
                     continue
                 if status is not None:
@@ -967,26 +999,49 @@ def logout(
         "--json",
         help="Emit OAuth events as JSON lines.",
     ),
+    platform: str = typer.Option(
+        "kimi-code",
+        "--platform",
+        help="Platform to log out from. Choices: kimi-code, openai-codex.",
+    ),
 ) -> None:
-    """Logout from your Kimi account."""
+    """Logout from your account (Kimi Code or OpenAI Codex)."""
     import asyncio
 
     from rich.console import Console
 
-    from kimi_cli.auth.oauth import logout_kimi_code
+    from kimi_cli.auth import KIMI_CODE_PLATFORM_ID, OPENAI_CODEX_PLATFORM_ID
     from kimi_cli.config import load_config
 
+    _VALID_PLATFORMS = {KIMI_CODE_PLATFORM_ID, OPENAI_CODEX_PLATFORM_ID}
+    if platform not in _VALID_PLATFORMS:
+        typer.echo(
+            f"Unknown platform '{platform}'. Choose from: {', '.join(sorted(_VALID_PLATFORMS))}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
     async def _run() -> bool:
+        # Construct a fresh generator in each branch to avoid re-iteration issues.
+        if platform == OPENAI_CODEX_PLATFORM_ID:
+            from kimi_cli.auth.codex_oauth import logout_openai_codex
+
+            stream = logout_openai_codex(load_config())
+        else:
+            from kimi_cli.auth.oauth import logout_kimi_code
+
+            stream = logout_kimi_code(load_config())
+
         ok = True
         if json:
-            async for event in logout_kimi_code(load_config()):
+            async for event in stream:
                 typer.echo(event.json)
                 if event.type == "error":
                     ok = False
             return ok
 
         console = Console()
-        async for event in logout_kimi_code(load_config()):
+        async for event in stream:
             match event.type:
                 case "error":
                     style = "red"

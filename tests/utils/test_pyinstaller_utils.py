@@ -118,6 +118,10 @@ def test_pyinstaller_datas():
         ("src/kimi_cli/tools/plan/enter_description.md", "kimi_cli/tools/plan"),
         ("src/kimi_cli/tools/shell/bash.md", "kimi_cli/tools/shell"),
         (
+            "src/kimi_cli/tools/delegate_agent/description.md",
+            "kimi_cli/tools/delegate_agent",
+        ),
+        (
             "src/kimi_cli/tools/think/think.md",
             "kimi_cli/tools/think",
         ),
@@ -156,6 +160,8 @@ def test_pyinstaller_hiddenimports():
             "kimi_cli.tools.agent",
             "kimi_cli.tools.ask_user",
             "kimi_cli.tools.background",
+            "kimi_cli.tools.delegate_agent",
+            "kimi_cli.tools.delegate_agent.acp_bridge",
             "kimi_cli.tools.display",
             "kimi_cli.tools.dmail",
             "kimi_cli.tools.file",

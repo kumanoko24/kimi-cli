@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from rich.status import Status
 
-from kimi_cli.auth import KIMI_CODE_PLATFORM_ID
+from kimi_cli.auth import KIMI_CODE_PLATFORM_ID, OPENAI_CODEX_PLATFORM_ID
 from kimi_cli.auth.oauth import login_kimi_code, logout_kimi_code
 from kimi_cli.auth.platforms import is_managed_provider_key, parse_managed_provider_key
 from kimi_cli.cli import Reload
@@ -48,6 +48,37 @@ async def _login_kimi_code(soul: KimiSoul) -> bool:
     return ok
 
 
+async def _login_openai_codex(soul: KimiSoul) -> bool:
+    from kimi_cli.auth.codex_oauth import login_openai_codex
+
+    status: Status | None = None
+    ok = True
+    try:
+        async for event in login_openai_codex(soul.runtime.config):
+            if event.type == "waiting":
+                if status is None:
+                    status = console.status("[cyan]Waiting for authorization...[/cyan]")
+                    status.start()
+                continue
+            if status is not None:
+                status.stop()
+                status = None
+            match event.type:
+                case "error":
+                    style = "red"
+                case "success":
+                    style = "green"
+                case _:
+                    style = None
+            console.print(event.message, markup=False, style=style)
+            if event.type == "error":
+                ok = False
+    finally:
+        if status is not None:
+            status.stop()
+    return ok
+
+
 def current_model_key(soul: KimiSoul) -> str | None:
     config = soul.runtime.config
     curr_model_cfg = soul.runtime.llm.model_config if soul.runtime.llm else None
@@ -69,6 +100,8 @@ async def login(app: Shell, args: str) -> None:
         return
     if platform.id == KIMI_CODE_PLATFORM_ID:
         ok = await _login_kimi_code(soul)
+    elif platform.id == OPENAI_CODEX_PLATFORM_ID:
+        ok = await _login_openai_codex(soul)
     else:
         ok = await setup_platform(platform)
     if not ok:
@@ -111,9 +144,16 @@ async def logout(app: Shell, args: str) -> None:
         console.print("[yellow]Current provider is not managed; nothing to logout.[/yellow]")
         return
 
-    if platform_id == KIMI_CODE_PLATFORM_ID:
+    if platform_id in (KIMI_CODE_PLATFORM_ID, OPENAI_CODEX_PLATFORM_ID):
+        if platform_id == OPENAI_CODEX_PLATFORM_ID:
+            from kimi_cli.auth.codex_oauth import logout_openai_codex
+
+            logout_stream = logout_openai_codex(config)
+        else:
+            logout_stream = logout_kimi_code(config)
+
         ok = True
-        async for event in logout_kimi_code(config):
+        async for event in logout_stream:
             match event.type:
                 case "error":
                     style = "red"

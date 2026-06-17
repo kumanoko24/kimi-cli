@@ -754,6 +754,19 @@ class KimiCLI:
                     level=WelcomeInfoItem.Level.INFO,
                 )
             )
+            from kimi_cli.auth.codex_oauth import openai_codex_session_email
+
+            if codex_email := openai_codex_session_email(
+                self._runtime.config,
+                self._runtime.llm.model_config if self._runtime.llm else None,
+            ):
+                welcome_info.append(
+                    WelcomeInfoItem(
+                        name="OpenAI Codex",
+                        value=codex_email,
+                        level=WelcomeInfoItem.Level.INFO,
+                    )
+                )
             model_name = self._soul.model_name
             if model_name not in (
                 "kimi-for-coding",

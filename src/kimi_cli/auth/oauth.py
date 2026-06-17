@@ -11,9 +11,9 @@ import tempfile
 import time
 import uuid
 import webbrowser
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -21,7 +21,7 @@ import aiohttp
 import keyring
 from pydantic import SecretStr
 
-from kimi_cli.auth import KIMI_CODE_PLATFORM_ID
+from kimi_cli.auth import KIMI_CODE_PLATFORM_ID, OPENAI_CODEX_PLATFORM_ID
 from kimi_cli.auth.platforms import (
     ModelInfo,
     get_platform_by_id,
@@ -102,6 +102,10 @@ class OAuthEvent:
         return json.dumps(payload, ensure_ascii=False)
 
 
+def _empty_metadata() -> dict[str, str]:
+    return {}
+
+
 @dataclass(slots=True)
 class OAuthToken:
     access_token: str
@@ -110,6 +114,7 @@ class OAuthToken:
     scope: str
     token_type: str
     expires_in: float = 0.0
+    metadata: dict[str, str] = field(default_factory=_empty_metadata)
 
     @classmethod
     def from_response(cls, payload: dict[str, Any]) -> OAuthToken:
@@ -124,7 +129,7 @@ class OAuthToken:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
             "expires_at": self.expires_at,
@@ -132,10 +137,21 @@ class OAuthToken:
             "token_type": self.token_type,
             "expires_in": self.expires_in,
         }
+        if self.metadata:
+            data["metadata"] = self.metadata
+        return data
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> OAuthToken:
         expires_at_value = payload.get("expires_at")
+        raw_metadata = payload.get("metadata")
+        metadata: dict[str, str] = {}
+        if isinstance(raw_metadata, dict):
+            metadata = {
+                str(key): str(value)
+                for key, value in cast(dict[Any, Any], raw_metadata).items()
+                if value is not None
+            }
         return cls(
             access_token=str(payload.get("access_token") or ""),
             refresh_token=str(payload.get("refresh_token") or ""),
@@ -143,6 +159,7 @@ class OAuthToken:
             scope=str(payload.get("scope") or ""),
             token_type=str(payload.get("token_type") or ""),
             expires_in=float(payload.get("expires_in") or 0),
+            metadata=metadata,
         )
 
 
@@ -754,6 +771,7 @@ class OAuthManager:
         self._access_tokens: dict[str, str] = {}
         self._refresh_lock = asyncio.Lock()
         self._migrate_oauth_storage()
+        self._import_openai_codex_cli_auth_if_needed(None)
         self._load_initial_tokens()
 
     def _iter_oauth_refs(self) -> list[OAuthRef]:
@@ -875,6 +893,145 @@ class OAuthManager:
                 return service.oauth
         return None
 
+    def _openai_codex_ref(self) -> OAuthRef | None:
+        provider_key = managed_provider_key(OPENAI_CODEX_PLATFORM_ID)
+        provider = self._config.providers.get(provider_key)
+        if provider and provider.oauth:
+            return provider.oauth
+        return None
+
+    def _apply_openai_codex_account_id(
+        self, runtime: Runtime | None, account_id: str | None
+    ) -> None:
+        if not account_id:
+            return
+        provider_key = managed_provider_key(OPENAI_CODEX_PLATFORM_ID)
+        provider = self._config.providers.get(provider_key)
+        if provider is None:
+            return
+        provider.custom_headers = {
+            **(provider.custom_headers or {}),
+            "ChatGPT-Account-Id": account_id,
+        }
+        self._apply_openai_codex_live_headers(runtime)
+
+    def _openai_codex_account_id(self) -> str | None:
+        provider = self._config.providers.get(managed_provider_key(OPENAI_CODEX_PLATFORM_ID))
+        if provider is None or not provider.custom_headers:
+            return None
+        value = provider.custom_headers.get("ChatGPT-Account-Id")
+        return value if value else None
+
+    def _hydrate_openai_codex_metadata(
+        self,
+        ref: OAuthRef,
+        token: OAuthToken,
+        runtime: Runtime | None,
+    ) -> None:
+        if token.metadata.get("email"):
+            return
+        from kimi_cli.auth.codex_oauth import find_openai_codex_cli_auth_metadata
+
+        metadata = find_openai_codex_cli_auth_metadata(account_id=self._openai_codex_account_id())
+        if not metadata:
+            return
+        merged = {**metadata, **token.metadata}
+        if merged == token.metadata:
+            return
+        token.metadata = merged
+        save_tokens(ref, token)
+        self._apply_openai_codex_account_id(runtime, merged.get("account_id"))
+
+    def _apply_openai_codex_live_headers(self, runtime: Runtime | None) -> None:
+        if runtime is None or runtime.llm is None or runtime.llm.model_config is None:
+            return
+        provider_key = managed_provider_key(OPENAI_CODEX_PLATFORM_ID)
+        if runtime.llm.model_config.provider != provider_key:
+            return
+        provider = runtime.config.providers.get(provider_key)
+        if provider is None:
+            return
+
+        from kosong.chat_provider.openai_common import (
+            close_replaced_openai_client,
+            create_openai_client,
+        )
+        from kosong.contrib.chat_provider.openai_responses import OpenAIResponses
+
+        chat_provider = runtime.llm.chat_provider
+        if not isinstance(chat_provider, OpenAIResponses):
+            return
+
+        client_kwargs = dict(
+            chat_provider._client_kwargs  # pyright: ignore[reportPrivateUsage]
+        )
+        if provider.custom_headers:
+            client_kwargs["default_headers"] = dict(provider.custom_headers)
+        else:
+            client_kwargs.pop("default_headers", None)
+
+        old_client = chat_provider.client
+        current_api_key = old_client.api_key
+        chat_provider._client_kwargs = client_kwargs  # pyright: ignore[reportPrivateUsage]
+        chat_provider._client = create_openai_client(  # pyright: ignore[reportPrivateUsage]
+            api_key=current_api_key,
+            base_url=chat_provider._base_url,  # pyright: ignore[reportPrivateUsage]
+            client_kwargs=client_kwargs,
+        )
+        chat_provider._api_key = current_api_key  # pyright: ignore[reportPrivateUsage]
+        close_replaced_openai_client(old_client, client_kwargs=client_kwargs)
+
+    def _import_openai_codex_cli_auth(self, ref: OAuthRef, runtime: Runtime | None) -> bool:
+        from kimi_cli.auth.codex_oauth import import_openai_codex_cli_auth
+
+        imported = import_openai_codex_cli_auth(ref)
+        if imported is None:
+            return False
+        self._apply_openai_codex_account_id(runtime, imported.account_id)
+        return True
+
+    def _import_openai_codex_cli_auth_if_needed(self, runtime: Runtime | None) -> bool:
+        ref = self._openai_codex_ref()
+        if ref is None:
+            return False
+        token = load_tokens(ref)
+        if token is not None and not self._should_suppress_persisted_token(ref, token):
+            self._hydrate_openai_codex_metadata(ref, token, runtime)
+            return False
+        return self._import_openai_codex_cli_auth(ref, runtime)
+
+    async def _ensure_fresh_provider(
+        self,
+        runtime: Runtime | None,
+        ref: OAuthRef,
+        *,
+        force: bool = False,
+        platform_id: str,
+        refresh_fn: Callable[[str], Awaitable[OAuthToken]] | None = None,
+    ) -> None:
+        token = load_tokens(ref)
+        if token is None:
+            return
+        if self._should_suppress_persisted_token(ref, token):
+            self._access_tokens.pop(ref.key, None)
+            self._apply_access_token(runtime, "", platform_id=platform_id)
+            if not self._can_retry_rejected_refresh_token(ref, token.refresh_token):
+                if force:
+                    raise OAuthUnauthorized("Refresh token was recently rejected.")
+                return
+        else:
+            self._cache_access_token(ref, token)
+            if token.access_token:
+                self._apply_access_token(runtime, token.access_token, platform_id=platform_id)
+        await self._refresh_tokens(
+            ref,
+            token,
+            runtime,
+            force=force,
+            platform_id=platform_id,
+            refresh_fn=refresh_fn,
+        )
+
     async def ensure_fresh(self, runtime: Runtime | None = None, *, force: bool = False) -> None:
         """Load persisted tokens, cache them, and refresh if close to expiry.
 
@@ -885,24 +1042,36 @@ class OAuthManager:
             force: When True, skip the expiry-threshold check and always
                 attempt a refresh.  Used after receiving a 401 from the server.
         """
-        ref = self._kimi_code_ref()
-        if ref is None:
-            return
-        token = load_tokens(ref)
-        if token is None:
-            return
-        if self._should_suppress_persisted_token(ref, token):
-            self._access_tokens.pop(ref.key, None)
-            self._apply_access_token(runtime, "")
-            if not self._can_retry_rejected_refresh_token(ref, token.refresh_token):
-                if force:
-                    raise OAuthUnauthorized("Refresh token was recently rejected.")
-                return
-        else:
-            self._cache_access_token(ref, token)
-            if token.access_token:
-                self._apply_access_token(runtime, token.access_token)
-        await self._refresh_tokens(ref, token, runtime, force=force)
+        kimi_ref = self._kimi_code_ref()
+        if kimi_ref is not None:
+            await self._ensure_fresh_provider(
+                runtime, kimi_ref, force=force, platform_id=KIMI_CODE_PLATFORM_ID
+            )
+
+        codex_ref = self._openai_codex_ref()
+        if codex_ref is not None:
+            from kimi_cli.auth.codex_oauth import refresh_openai_codex_token
+
+            self._import_openai_codex_cli_auth_if_needed(runtime)
+
+            try:
+                await self._ensure_fresh_provider(
+                    runtime,
+                    codex_ref,
+                    force=force,
+                    platform_id=OPENAI_CODEX_PLATFORM_ID,
+                    refresh_fn=refresh_openai_codex_token,
+                )
+            except OAuthUnauthorized:
+                if not force or not self._import_openai_codex_cli_auth(codex_ref, runtime):
+                    raise
+                await self._ensure_fresh_provider(
+                    runtime,
+                    codex_ref,
+                    force=force,
+                    platform_id=OPENAI_CODEX_PLATFORM_ID,
+                    refresh_fn=refresh_openai_codex_token,
+                )
 
     @asynccontextmanager
     async def refreshing(self, runtime: Runtime) -> AsyncIterator[None]:
@@ -955,6 +1124,8 @@ class OAuthManager:
         runtime: Runtime | None,
         *,
         force: bool = False,
+        platform_id: str = KIMI_CODE_PLATFORM_ID,
+        refresh_fn: Callable[[str], Awaitable[OAuthToken]] | None = None,
     ) -> None:
         # Always prefer persisted tokens before refresh to avoid stale cache
         # when multiple sessions might have already rotated the refresh token.
@@ -985,10 +1156,12 @@ class OAuthManager:
                 ref, current
             ) and not self._can_retry_rejected_refresh_token(ref, refresh_token_value):
                 self._access_tokens.pop(ref.key, None)
-                self._apply_access_token(runtime, "")
+                self._apply_access_token(runtime, "", platform_id=platform_id)
                 if force:
                     raise OAuthUnauthorized("Refresh token was recently rejected.")
                 return
+
+            _do_refresh = refresh_fn or refresh_token
 
             # Acquire cross-process file lock to coordinate with other
             # kimi-cli instances (terminal, VS Code, web).
@@ -1002,7 +1175,9 @@ class OAuthManager:
                     if locked_token and locked_token.refresh_token != refresh_token_value:
                         self._clear_rejected_refresh_token(ref)
                         self._cache_access_token(ref, locked_token)
-                        self._apply_access_token(runtime, locked_token.access_token)
+                        self._apply_access_token(
+                            runtime, locked_token.access_token, platform_id=platform_id
+                        )
                         return
                     if not force and locked_token:
                         remaining = locked_token.expires_at - time.time()
@@ -1011,13 +1186,15 @@ class OAuthManager:
                         ):
                             self._clear_rejected_refresh_token(ref)
                             self._cache_access_token(ref, locked_token)
-                            self._apply_access_token(runtime, locked_token.access_token)
+                            self._apply_access_token(
+                                runtime, locked_token.access_token, platform_id=platform_id
+                            )
                             return
                 else:
                     logger.warning("Could not acquire cross-process lock for token refresh")
 
                 try:
-                    refreshed = await refresh_token(refresh_token_value)
+                    refreshed = await _do_refresh(refresh_token_value)
                 except OAuthUnauthorized as exc:
                     # Give a concurrent instance time to persist its rotated token.
                     await asyncio.sleep(1)
@@ -1025,7 +1202,9 @@ class OAuthManager:
                     if latest and latest.refresh_token != refresh_token_value:
                         self._clear_rejected_refresh_token(ref)
                         self._cache_access_token(ref, latest)
-                        self._apply_access_token(runtime, latest.access_token)
+                        self._apply_access_token(
+                            runtime, latest.access_token, platform_id=platform_id
+                        )
                         return
                     # delete_tokens(ref) would remove whatever the ref points
                     # to on disk right now, not "the refresh_token that just
@@ -1041,7 +1220,7 @@ class OAuthManager:
                     # /login still atomically overwrites the file.
                     self._mark_refresh_token_rejected(ref, refresh_token_value)
                     self._access_tokens.pop(ref.key, None)
-                    self._apply_access_token(runtime, "")
+                    self._apply_access_token(runtime, "", platform_id=platform_id)
                     if force:
                         raise
                     logger.warning(
@@ -1061,29 +1240,61 @@ class OAuthManager:
                     track("oauth_refresh", success=False, reason="network_or_other")
                     return
                 self._clear_rejected_refresh_token(ref)
+                if current.metadata and not refreshed.metadata:
+                    refreshed.metadata = dict(current.metadata)
                 save_tokens(ref, refreshed)
                 self._cache_access_token(ref, refreshed)
-                self._apply_access_token(runtime, refreshed.access_token)
+                self._apply_access_token(runtime, refreshed.access_token, platform_id=platform_id)
                 from kimi_cli.telemetry import track
 
                 track("oauth_refresh", success=True)
             finally:
                 xlock.release()
 
-    def _apply_access_token(self, runtime: Runtime | None, access_token: str) -> None:
+    def _apply_access_token(
+        self,
+        runtime: Runtime | None,
+        access_token: str,
+        *,
+        platform_id: str = KIMI_CODE_PLATFORM_ID,
+    ) -> None:
         if runtime is None:
             return
-        provider_key = managed_provider_key(KIMI_CODE_PLATFORM_ID)
         if runtime.llm is None or runtime.llm.model_config is None:
             return
+        provider_key = managed_provider_key(platform_id)
         if runtime.llm.model_config.provider != provider_key:
             return
-        from kosong.chat_provider.kimi import Kimi
-
-        assert isinstance(runtime.llm.chat_provider, Kimi), "Expected Kimi chat provider"
         provider = runtime.config.providers.get(provider_key)
         fallback_api_key = provider.api_key.get_secret_value() if provider else ""
-        runtime.llm.chat_provider.client.api_key = access_token or fallback_api_key
+        effective_key = access_token or fallback_api_key
+
+        if platform_id == KIMI_CODE_PLATFORM_ID:
+            from kosong.chat_provider.kimi import Kimi
+
+            if not isinstance(runtime.llm.chat_provider, Kimi):
+                logger.error(
+                    "Provider type mismatch for {platform}: expected Kimi, got {got}",
+                    platform=platform_id,
+                    got=type(runtime.llm.chat_provider).__name__,
+                )
+                return
+            runtime.llm.chat_provider.client.api_key = effective_key
+        elif platform_id == OPENAI_CODEX_PLATFORM_ID:
+            from kosong.contrib.chat_provider.openai_responses import OpenAIResponses
+
+            if not isinstance(runtime.llm.chat_provider, OpenAIResponses):
+                logger.error(
+                    "Provider type mismatch for {platform}: expected OpenAIResponses, got {got}",
+                    platform=platform_id,
+                    got=type(runtime.llm.chat_provider).__name__,
+                )
+                return
+            runtime.llm.chat_provider.client.api_key = effective_key
+        else:
+            raise NotImplementedError(
+                f"_apply_access_token: no live key-update handler for platform {platform_id!r}"
+            )
 
 
 if __name__ == "__main__":

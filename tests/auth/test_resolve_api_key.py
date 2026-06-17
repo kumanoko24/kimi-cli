@@ -1,19 +1,29 @@
 """Tests for OAuthManager: resolve_api_key and ensure_fresh behavior."""
 
+import base64
+import json
 import time
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from kosong.contrib.chat_provider.openai_responses import OpenAIResponses
 from pydantic import SecretStr
 
+from kimi_cli.auth import OPENAI_CODEX_PLATFORM_ID
+from kimi_cli.auth.codex_oauth import _codex_token_from_response, openai_codex_session_email
 from kimi_cli.auth.oauth import (
     _REJECTED_REFRESH_TOKENS,
     OAuthManager,
     OAuthToken,
     OAuthUnauthorized,
     _save_to_file,
+    load_tokens,
 )
+from kimi_cli.auth.platforms import managed_model_key, managed_provider_key
 from kimi_cli.config import Config, LLMModel, LLMProvider, OAuthRef, Services
+from kimi_cli.llm import LLM
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +45,24 @@ def _make_config(*, with_oauth: bool = True, api_key: str = "") -> Config:
         default_model="managed:kimi-code/test-model",
         providers={"managed:kimi-code": provider},
         models={"managed:kimi-code/test-model": model},
+        services=Services(),
+    )
+
+
+def _make_openai_codex_config() -> Config:
+    provider_key = managed_provider_key(OPENAI_CODEX_PLATFORM_ID)
+    model_key = managed_model_key(OPENAI_CODEX_PLATFORM_ID, "codex-mini-latest")
+    provider = LLMProvider(
+        type="openai_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key=SecretStr(""),
+        oauth=OAuthRef(storage="file", key="oauth/openai-codex"),
+    )
+    model = LLMModel(provider=provider_key, model="codex-mini-latest", max_context_size=128_000)
+    return Config(
+        default_model=model_key,
+        providers={provider_key: provider},
+        models={model_key: model},
         services=Services(),
     )
 
@@ -203,6 +231,263 @@ async def test_ensure_fresh_without_runtime_refreshes_expired_token():
     ref = OAuthRef(storage="file", key="oauth/kimi-code")
     result = oauth.resolve_api_key(SecretStr(""), ref)
     assert result == "refreshed-access"
+
+
+def test_openai_codex_cli_auth_imported_before_initial_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIMI_SHARE_DIR", str(tmp_path / "kimi"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    (codex_home / "auth.json").write_text(
+        """
+        {
+          "tokens": {
+            "access_token": "codex-access",
+            "refresh_token": "codex-refresh",
+            "account_id": "chatgpt-account",
+            "email": "codex-user@example.com"
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    config = _make_openai_codex_config()
+    oauth = OAuthManager(config)
+    provider = config.providers[managed_provider_key(OPENAI_CODEX_PLATFORM_ID)]
+    ref = OAuthRef(storage="file", key="oauth/openai-codex")
+
+    assert provider.custom_headers == {"ChatGPT-Account-Id": "chatgpt-account"}
+    assert oauth.resolve_api_key(SecretStr(""), ref) == "codex-access"
+    imported_token = load_tokens(ref)
+    assert imported_token is not None
+    assert imported_token.metadata["email"] == "codex-user@example.com"
+    assert openai_codex_session_email(config, config.models[config.default_model]) == (
+        "codex-user@example.com"
+    )
+
+
+def test_openai_codex_existing_token_hydrates_email_from_codex_cli_auth(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIMI_SHARE_DIR", str(tmp_path / "kimi"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    (codex_home / "auth.json").write_text(
+        """
+        {
+          "tokens": {
+            "access_token": "codex-cli-access",
+            "refresh_token": "codex-cli-refresh",
+            "account_id": "chatgpt-account",
+            "email": "codex-user@example.com"
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    _save_to_file(
+        "oauth/openai-codex",
+        OAuthToken(
+            access_token="existing-access",
+            refresh_token="existing-refresh",
+            expires_at=time.time() + 3600,
+            scope="",
+            token_type="Bearer",
+        ),
+    )
+
+    config = _make_openai_codex_config()
+    provider = config.providers[managed_provider_key(OPENAI_CODEX_PLATFORM_ID)]
+    provider.custom_headers = {"ChatGPT-Account-Id": "chatgpt-account"}
+    OAuthManager(config)
+
+    stored = load_tokens(OAuthRef(storage="file", key="oauth/openai-codex"))
+    assert stored is not None
+    assert stored.access_token == "existing-access"
+    assert stored.metadata["email"] == "codex-user@example.com"
+    assert openai_codex_session_email(config, config.models[config.default_model]) == (
+        "codex-user@example.com"
+    )
+
+
+def test_openai_codex_session_email_hydrates_missing_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIMI_SHARE_DIR", str(tmp_path / "kimi"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    (codex_home / "auth.json").write_text(
+        """
+        {
+          "tokens": {
+            "access_token": "codex-cli-access",
+            "refresh_token": "codex-cli-refresh",
+            "account_id": "chatgpt-account",
+            "email": "codex-user@example.com"
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    ref = OAuthRef(storage="file", key="oauth/openai-codex")
+    _save_to_file(
+        ref.key,
+        OAuthToken(
+            access_token="existing-access",
+            refresh_token="existing-refresh",
+            expires_at=time.time() + 3600,
+            scope="",
+            token_type="Bearer",
+        ),
+    )
+
+    config = _make_openai_codex_config()
+    provider = config.providers[managed_provider_key(OPENAI_CODEX_PLATFORM_ID)]
+    provider.custom_headers = {"ChatGPT-Account-Id": "chatgpt-account"}
+
+    assert openai_codex_session_email(config, config.models[config.default_model]) == (
+        "codex-user@example.com"
+    )
+    stored = load_tokens(ref)
+    assert stored is not None
+    assert stored.metadata["email"] == "codex-user@example.com"
+
+
+def test_openai_codex_session_email_requires_active_codex_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIMI_SHARE_DIR", str(tmp_path / "kimi"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    _save_to_file(
+        "oauth/openai-codex",
+        OAuthToken(
+            access_token="codex-access",
+            refresh_token="codex-refresh",
+            expires_at=0.0,
+            scope="",
+            token_type="Bearer",
+            metadata={"email": "codex-user@example.com"},
+        ),
+    )
+    codex_config = _make_openai_codex_config()
+    kimi_config = _make_config(with_oauth=True)
+
+    assert openai_codex_session_email(codex_config, codex_config.models[codex_config.default_model])
+    assert (
+        openai_codex_session_email(kimi_config, kimi_config.models[kimi_config.default_model])
+        is None
+    )
+
+    codex_config.providers[managed_provider_key(OPENAI_CODEX_PLATFORM_ID)].oauth = None
+    assert (
+        openai_codex_session_email(codex_config, codex_config.models[codex_config.default_model])
+        is None
+    )
+
+
+def _unsigned_jwt(payload: dict[str, Any]) -> str:
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    return f"e30.{encoded}.signature"
+
+
+def test_openai_codex_response_id_token_metadata_extracts_email():
+    token = _codex_token_from_response(
+        {
+            "access_token": "codex-access",
+            "refresh_token": "codex-refresh",
+            "expires_in": 3600,
+            "scope": "openid profile email offline_access",
+            "token_type": "Bearer",
+            "id_token": _unsigned_jwt(
+                {
+                    "email": "codex-user@example.com",
+                    "chatgpt_account_id": "chatgpt-account",
+                }
+            ),
+        }
+    )
+
+    assert token.metadata == {
+        "account_id": "chatgpt-account",
+        "email": "codex-user@example.com",
+    }
+
+
+def test_openai_codex_account_id_updates_live_openai_client(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIMI_SHARE_DIR", str(tmp_path / "kimi"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex-home"))
+    config = _make_openai_codex_config()
+    oauth = OAuthManager(config)
+    provider_key = managed_provider_key(OPENAI_CODEX_PLATFORM_ID)
+    model_key = managed_model_key(OPENAI_CODEX_PLATFORM_ID, "codex-mini-latest")
+    chat_provider = OpenAIResponses(
+        model="codex-mini-latest",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="access-token",
+    )
+    llm = LLM(
+        chat_provider=chat_provider,
+        max_context_size=128_000,
+        capabilities=set(),
+        model_config=config.models[model_key],
+        provider_config=config.providers[provider_key],
+    )
+    runtime = cast(Any, SimpleNamespace(config=config, llm=llm))
+
+    oauth._apply_openai_codex_account_id(runtime, "live-account")
+
+    assert chat_provider.client.default_headers["ChatGPT-Account-Id"] == "live-account"
+
+
+@pytest.mark.asyncio
+async def test_openai_codex_force_refresh_does_not_preemptively_import(tmp_path, monkeypatch):
+    monkeypatch.setenv("KIMI_SHARE_DIR", str(tmp_path / "kimi"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    (codex_home / "auth.json").write_text(
+        """
+        {
+          "tokens": {
+            "access_token": "imported-access",
+            "refresh_token": "imported-refresh",
+            "account_id": "imported-account"
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    existing = OAuthToken(
+        access_token="existing-access",
+        refresh_token="existing-refresh",
+        expires_at=time.time() + 3600,
+        scope="",
+        token_type="Bearer",
+        metadata={"email": "codex-user@example.com"},
+    )
+    refreshed = OAuthToken(
+        access_token="refreshed-access",
+        refresh_token="refreshed-refresh",
+        expires_at=time.time() + 3600,
+        scope="",
+        token_type="Bearer",
+    )
+    _save_to_file("oauth/openai-codex", existing)
+
+    config = _make_openai_codex_config()
+    oauth = OAuthManager(config)
+
+    refresh = AsyncMock(return_value=refreshed)
+    with patch("kimi_cli.auth.codex_oauth.refresh_openai_codex_token", refresh):
+        await oauth.ensure_fresh(force=True)
+
+    refresh.assert_awaited_once_with("existing-refresh")
+    stored = load_tokens(OAuthRef(storage="file", key="oauth/openai-codex"))
+    assert stored is not None
+    assert stored.access_token == "refreshed-access"
+    assert stored.metadata["email"] == "codex-user@example.com"
 
 
 @pytest.mark.asyncio
